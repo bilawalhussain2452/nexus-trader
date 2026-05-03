@@ -1,344 +1,375 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 
-// ============================================================
-// BINANCE PUBLIC API — no API key required
-// ============================================================
-const BINANCE_API = "https://api.binance.com/api/v3";
+const API = "https://api.binance.com/api/v3";
 
-async function fetchTopMovers() {
-  try {
-    const res = await fetch(`${BINANCE_API}/ticker/24hr`);
-    const data = await res.json();
-    const usdt = data
-      .filter((t) => t.symbol.endsWith("USDT") && !t.symbol.includes("DOWN") && !t.symbol.includes("UP") && !t.symbol.includes("BULL") && !t.symbol.includes("BEAR"))
-      .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
-      .slice(0, 2)
-      .map((t) => ({ symbol: t.symbol, label: t.symbol.replace("USDT", "/USDT"), price: parseFloat(t.lastPrice), changePercent: parseFloat(t.priceChangePercent), volume: parseFloat(t.quoteVolume) }));
-    return usdt;
-  } catch { return [{ symbol: "BTCUSDT", label: "BTC/USDT", price: 67000, changePercent: 0, volume: 0 }, { symbol: "ETHUSDT", label: "ETH/USDT", price: 3500, changePercent: 0, volume: 0 }]; }
+function ema(arr, n) {
+  if (arr.length < n) return null;
+  const k = 2 / (n + 1);
+  let e = arr.slice(0, n).reduce((a, b) => a + b) / n;
+  for (let i = n; i < arr.length; i++) e = arr[i] * k + e * (1 - k);
+  return e;
 }
 
-async function searchPairs(query) {
+function rsi(arr, n = 14) {
+  if (arr.length < n + 1) return 50;
+  const ch = arr.slice(1).map((p, i) => p - arr[i]);
+  const ag = ch.slice(0, n).filter(x => x > 0).reduce((a, b) => a + b, 0) / n;
+  const al = ch.slice(0, n).filter(x => x < 0).map(Math.abs).reduce((a, b) => a + b, 0) / n;
+  return al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+}
+
+function bb(arr, n = 20) {
+  if (arr.length < n) return null;
+  const sl = arr.slice(-n);
+  const m = sl.reduce((a, b) => a + b) / n;
+  const s = Math.sqrt(sl.reduce((a, b) => a + (b - m) ** 2, 0) / n);
+  return { upper: m + 2 * s, middle: m, lower: m - 2 * s };
+}
+
+function analyze(closes) {
+  if (closes.length < 50) return { signal: "WAIT", conf: 0, rsi: 50, bb: null, ema20: null };
+  const r = rsi(closes);
+  const e20 = ema(closes, 20);
+  const e50 = ema(closes, 50);
+  const b = bb(closes);
+  const p = closes[closes.length - 1];
+  let score = 0;
+  if (e20 && e50) score += e20 > e50 && p > e20 ? 1 : e20 < e50 && p < e20 ? -1 : 0;
+  score += r < 35 ? 1 : r > 65 ? -1 : 0;
+  if (b) score += p < b.lower ? 1 : p > b.upper ? -1 : 0;
+  const atr = Math.abs(closes[closes.length - 1] - closes[closes.length - 5]) || p * 0.01;
+  const signal = score >= 2 ? "BUY" : score <= -2 ? "SELL" : "HOLD";
+  const conf = signal !== "HOLD" ? Math.min(92, 55 + Math.abs(score) * 15) : 35;
+  const sl = signal === "BUY" ? p - atr * 2 : p + atr * 2;
+  const tp = signal === "BUY" ? p + atr * 3 : p - atr * 3;
+  return { signal, conf, rsi: r, bb: b, ema20: e20, sl, tp };
+}
+
+async function getTopMovers() {
   try {
-    const res = await fetch(`${BINANCE_API}/ticker/24hr`);
-    const data = await res.json();
-    const q = query.toUpperCase().replace("/", "").replace("-", "");
-    return data
-      .filter((t) => t.symbol.endsWith("USDT") && t.symbol.includes(q) && !t.symbol.includes("DOWN") && !t.symbol.includes("UP"))
-      .slice(0, 6)
-      .map((t) => ({ symbol: t.symbol, label: t.symbol.replace("USDT", "/USDT"), price: parseFloat(t.lastPrice), changePercent: parseFloat(t.priceChangePercent) }));
+    const r = await fetch(`${API}/ticker/24hr`);
+    const d = await r.json();
+    return d.filter(t => t.symbol.endsWith("USDT") && !/(DOWN|UP|BULL|BEAR)/.test(t.symbol))
+      .sort((a, b) => Math.abs(+b.priceChangePercent) - Math.abs(+a.priceChangePercent))
+      .slice(0, 2).map(t => ({ symbol: t.symbol, label: t.symbol.replace("USDT", "/USDT"), price: +t.lastPrice, pct: +t.priceChangePercent }));
+  } catch { return [{ symbol: "BTCUSDT", label: "BTC/USDT", price: 67000, pct: 0 }, { symbol: "ETHUSDT", label: "ETH/USDT", price: 3500, pct: 0 }]; }
+}
+
+async function searchCoins(q) {
+  try {
+    const r = await fetch(`${API}/ticker/24hr`);
+    const d = await r.json();
+    return d.filter(t => t.symbol.endsWith("USDT") && t.symbol.includes(q.toUpperCase()) && !/(DOWN|UP|BULL|BEAR)/.test(t.symbol))
+      .slice(0, 5).map(t => ({ symbol: t.symbol, label: t.symbol.replace("USDT", "/USDT"), price: +t.lastPrice, pct: +t.priceChangePercent }));
   } catch { return []; }
 }
 
-async function fetchKlines(symbol, interval = "5m", limit = 100) {
+async function getKlines(symbol) {
   try {
-    const res = await fetch(`${BINANCE_API}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-    const data = await res.json();
-    return data.map((k) => ({ open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5]) }));
+    const r = await fetch(`${API}/klines?symbol=${symbol}&interval=5m&limit=100`);
+    const d = await r.json();
+    return d.map(k => +k[4]);
   } catch { return []; }
 }
 
-async function fetchTicker(symbol) {
+async function getTicker(symbol) {
   try {
-    const res = await fetch(`${BINANCE_API}/ticker/24hr?symbol=${symbol}`);
-    const d = await res.json();
-    return { price: parseFloat(d.lastPrice), changePercent: parseFloat(d.priceChangePercent), high: parseFloat(d.highPrice), low: parseFloat(d.lowPrice), volume: parseFloat(d.quoteVolume) };
+    const r = await fetch(`${API}/ticker/24hr?symbol=${symbol}`);
+    const d = await r.json();
+    return { price: +d.lastPrice, pct: +d.priceChangePercent };
   } catch { return null; }
 }
 
-// ============================================================
-// TRADING ENGINE
-// ============================================================
-const TE = {
-  EMA: (data, period) => {
-    if (data.length < period) return null;
-    const k = 2 / (period + 1);
-    let ema = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    for (let i = period; i < data.length; i++) ema = data[i] * k + ema * (1 - k);
-    return ema;
-  },
-  RSI: (prices, period = 14) => {
-    if (prices.length < period + 1) return 50;
-    const changes = prices.slice(1).map((p, i) => p - prices[i]);
-    const gains = changes.map((c) => (c > 0 ? c : 0));
-    const losses = changes.map((c) => (c < 0 ? Math.abs(c) : 0));
-    const ag = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    const al = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    if (al === 0) return 100;
-    return 100 - 100 / (1 + ag / al);
-  },
-  BB: (prices, period = 20) => {
-    if (prices.length < period) return null;
-    const slice = prices.slice(-period);
-    const sma = slice.reduce((a, b) => a + b, 0) / period;
-    const std = Math.sqrt(slice.reduce((a, b) => a + Math.pow(b - sma, 2), 0) / period);
-    return { upper: sma + 2 * std, middle: sma, lower: sma - 2 * std };
-  },
-  ATR: (highs, lows, closes, period = 14) => {
-    if (closes.length < period + 1) return closes[closes.length - 1] * 0.01;
-    const trs = closes.slice(1).map((_, i) => Math.max(highs[i + 1] - lows[i + 1], Math.abs(highs[i + 1] - closes[i]), Math.abs(lows[i + 1] - closes[i])));
-    return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
-  },
-  analyze: (closes, highs, lows) => {
-    if (closes.length < 50) return { signal: "WAIT", confidence: 0, rsi: 50, bb: null, ema20: null, ema50: null };
-    const rsi = TE.RSI(closes);
-    const ema20 = TE.EMA(closes, 20);
-    const ema50 = TE.EMA(closes, 50);
-    const bb = TE.BB(closes);
-    const price = closes[closes.length - 1];
-    const atr = TE.ATR(highs, lows, closes);
-    let score = 0, signals = 0;
-    // Trend
-    if (ema20 && ema50) { signals++; if (ema20 > ema50 && price > ema20) score += 1; else if (ema20 < ema50 && price < ema20) score -= 1; }
-    // RSI
-    signals++; if (rsi < 35) score += 1; else if (rsi > 65) score -= 1;
-    // BB
-    if (bb) { signals++; if (price < bb.lower) score += 1; else if (price > bb.upper) score -= 1; }
-    // Recent momentum
-    if (closes.length >= 3) { signals++; const mom = (closes[closes.length - 1] - closes[closes.length - 4]) / closes[closes.length - 4] * 100; if (mom > 0.3) score += 1; else if (mom < -0.3) score -= 1; }
-    const ratio = score / signals;
-    let signal = "HOLD", confidence = 40;
-    if (ratio >= 0.5) { signal = "BUY"; confidence = 50 + ratio * 45; }
-    else if (ratio <= -0.5) { signal = "SELL"; confidence = 50 + Math.abs(ratio) * 45; }
-    const sl = signal === "BUY" ? price - atr * 2 : price + atr * 2;
-    const tp = signal === "BUY" ? price + atr * 3 : price - atr * 3;
-    return { signal, confidence: Math.min(95, confidence), rsi, bb, ema20, ema50, sl, tp, atr };
-  },
-};
-
-// ============================================================
-// MINI CHART
-// ============================================================
-const MiniSparkline = ({ prices, height = 40, width = 100 }) => {
-  if (!prices || prices.length < 2) return <svg width={width} height={height} />;
-  const min = Math.min(...prices), max = Math.max(...prices), range = max - min || 1;
-  const pts = prices.map((p, i) => `${(i / (prices.length - 1)) * width},${height - ((p - min) / range) * height * 0.9 - height * 0.05}`).join(" ");
-  const isUp = prices[prices.length - 1] >= prices[0];
-  const c = isUp ? "#00e87a" : "#ff3d5a";
-  return (
-    <svg width={width} height={height}>
-      <defs><linearGradient id={`sg${width}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={c} stopOpacity="0.18" /><stop offset="100%" stopColor={c} stopOpacity="0" /></linearGradient></defs>
-      <polygon points={`0,${height} ${pts} ${width},${height}`} fill={`url(#sg${width})`} />
-      <polyline points={pts} fill="none" stroke={c} strokeWidth="1.5" strokeLinejoin="round" />
-    </svg>
-  );
-};
-
-// ============================================================
-// SIGNAL BADGE
-// ============================================================
-const Badge = ({ s, conf }) => {
-  const cfg = { BUY: ["#00e87a", "#0a2118"], SELL: ["#ff3d5a", "#220a0f"], HOLD: ["#f5c518", "#1e1900"], WAIT: ["#666", "#111"] };
-  const [fg, bg] = cfg[s] || cfg.HOLD;
-  return <span style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 800, letterSpacing: 1.5, padding: "3px 9px", borderRadius: 3, background: bg, color: fg, border: `1px solid ${fg}44` }}>{s === "BUY" ? "▲ " : s === "SELL" ? "▼ " : "◆ "}{s}{conf > 0 ? ` ${conf.toFixed(0)}%` : ""}</span>;
-};
-
-// ============================================================
-// PAIR CARD
-// ============================================================
-const PairCard = ({ pair, analysis, isActive, isAuto, onSelect, onRemove }) => {
-  const pct = pair.changePercent || 0;
-  const isUp = pct >= 0;
-  return (
-    <div onClick={onSelect} style={{ cursor: "pointer", padding: "12px 14px", borderRadius: 10, border: `1px solid ${isActive ? "rgba(0,232,122,0.35)" : "rgba(255,255,255,0.07)"}`, background: isActive ? "rgba(0,232,122,0.04)" : "rgba(255,255,255,0.02)", transition: "all 0.2s", position: "relative" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 13, fontWeight: 700, color: isActive ? "#00e87a" : "#ddd", fontFamily: "'DM Mono', monospace" }}>{pair.label}</span>
-            {isAuto && <span style={{ fontSize: 8, padding: "1px 5px", background: "rgba(245,197,24,0.15)", color: "#f5c518", borderRadius: 3, fontFamily: "monospace", letterSpacing: 1 }}>AUTO</span>}
-          </div>
-          <div style={{ fontSize: 16, fontWeight: 800, color: "#fff", fontFamily: "'DM Mono', monospace", marginTop: 2 }}>
-            ${pair.price < 1 ? pair.price.toFixed(6) : pair.price < 100 ? pair.price.toFixed(4) : pair.price.toFixed(2)}
-          </div>
-          <div style={{ fontSize: 10, fontFamily: "monospace", color: isUp ? "#00e87a" : "#ff3d5a", marginTop: 1 }}>{isUp ? "▲" : "▼"} {Math.abs(pct).toFixed(2)}% 24h</div>
-        </div>
-        <div style={{ textAlign: "right" }}>
-          {analysis && <Badge s={analysis.signal} conf={analysis.confidence} />}
-          <MiniSparkline prices={pair.closes || []} width={90} height={38} />
-        </div>
-      </div>
-      {!isAuto && (
-        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} style={{ position: "absolute", top: 6, right: 6, background: "rgba(255,61,90,0.15)", border: "1px solid rgba(255,61,90,0.3)", color: "#ff3d5a", borderRadius: 4, width: 18, height: 18, fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 }}>✕</button>
-      )}
-    </div>
-  );
-};
-
-// ============================================================
-// MAIN APP
-// ============================================================
 export default function App() {
-  const [pairs, setPairs] = useState([]); // [{symbol, label, price, changePercent, closes:[], highs:[], lows:[], isAuto}]
+  const [pairs, setPairs] = useState([]);
+  const [active, setActive] = useState(null);
   const [analyses, setAnalyses] = useState({});
-  const [activePair, setActivePair] = useState(null);
-  const [isRunning, setIsRunning] = useState(false);
-  const [mode, setMode] = useState("CONSERVATIVE");
+  const [running, setRunning] = useState(false);
+  const [mode, setMode] = useState("SAFE");
   const [logs, setLogs] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState([]);
-  const [searching, setSearching] = useState(false);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
   const [showSearch, setShowSearch] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [tick, setTick] = useState(0);
-  const intervalRef = useRef(null);
-  const searchTimeout = useRef(null);
+  const timer = useRef(null);
+  const searchTimer = useRef(null);
 
-  const log = useCallback((type, msg) => {
+  const log = (type, msg) => {
     const t = new Date();
-    const time = `${String(t.getHours()).padStart(2,"0")}:${String(t.getMinutes()).padStart(2,"0")}:${String(t.getSeconds()).padStart(2,"0")}`;
-    setLogs((prev) => [{ type, msg, time, id: Math.random() }, ...prev].slice(0, 60));
-  }, []);
+    const time = [t.getHours(), t.getMinutes(), t.getSeconds()].map(n => String(n).padStart(2, "0")).join(":");
+    setLogs(prev => [{ type, msg, time, id: Math.random() }, ...prev].slice(0, 50));
+  };
 
-  // Init: fetch top 2 movers
   useEffect(() => {
     (async () => {
-      setLoading(true);
-      log("SYS", "Fetching top movers from Binance...");
-      const movers = await fetchTopMovers();
-      const enriched = await Promise.all(movers.map(async (m) => {
-        const klines = await fetchKlines(m.symbol, "5m", 100);
-        return { ...m, closes: klines.map((k) => k.close), highs: klines.map((k) => k.high), lows: klines.map((k) => k.low), isAuto: true };
+      log("SYS", "Loading top movers from Binance...");
+      const movers = await getTopMovers();
+      const enriched = await Promise.all(movers.map(async m => {
+        const closes = await getKlines(m.symbol);
+        return { ...m, closes, auto: true };
       }));
       setPairs(enriched);
-      setActivePair(enriched[0]?.symbol || null);
+      setActive(enriched[0]?.symbol);
       const a = {};
-      enriched.forEach((p) => { a[p.symbol] = TE.analyze(p.closes, p.highs, p.lows); });
+      enriched.forEach(p => { a[p.symbol] = analyze(p.closes); });
       setAnalyses(a);
-      log("INFO", `Auto-loaded: ${enriched.map((p) => p.label).join(", ")}`);
+      log("INFO", `Loaded: ${enriched.map(p => p.label).join(", ")}`);
       setLoading(false);
     })();
   }, []);
 
-  // Search handler
   useEffect(() => {
-    if (!searchQuery.trim()) { setSearchResults([]); return; }
-    clearTimeout(searchTimeout.current);
-    setSearching(true);
-    searchTimeout.current = setTimeout(async () => {
-      const results = await searchPairs(searchQuery);
-      setSearchResults(results);
-      setSearching(false);
-    }, 500);
-  }, [searchQuery]);
+    if (!query.trim()) { setResults([]); return; }
+    clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(async () => {
+      const r = await searchCoins(query);
+      setResults(r);
+    }, 600);
+  }, [query]);
 
-  const addManualPair = async (pair) => {
-    if (pairs.length >= 4) { log("WARN", "Max 4 pairs. Remove one first."); return; }
-    if (pairs.find((p) => p.symbol === pair.symbol)) { log("WARN", `${pair.label} already added.`); return; }
-    log("INFO", `Loading ${pair.label}...`);
-    const klines = await fetchKlines(pair.symbol, "5m", 100);
-    const enriched = { ...pair, closes: klines.map((k) => k.close), highs: klines.map((k) => k.high), lows: klines.map((k) => k.low), isAuto: false };
-    setPairs((prev) => [...prev, enriched]);
-    setAnalyses((prev) => ({ ...prev, [pair.symbol]: TE.analyze(enriched.closes, enriched.highs, enriched.lows) }));
-    setActivePair(pair.symbol);
+  const addPair = async (pair) => {
+    if (pairs.length >= 4) return log("WARN", "Max 4 pairs!");
+    if (pairs.find(p => p.symbol === pair.symbol)) return log("WARN", "Already added!");
+    const closes = await getKlines(pair.symbol);
+    const p = { ...pair, closes, auto: false };
+    setPairs(prev => [...prev, p]);
+    setAnalyses(prev => ({ ...prev, [pair.symbol]: analyze(closes) }));
+    setActive(pair.symbol);
     setShowSearch(false);
-    setSearchQuery("");
-    setSearchResults([]);
-    log("INFO", `${pair.label} added successfully.`);
+    setQuery("");
+    setResults([]);
+    log("INFO", `Added ${pair.label}`);
   };
 
   const removePair = (symbol) => {
-    setPairs((prev) => prev.filter((p) => p.symbol !== symbol));
-    setAnalyses((prev) => { const n = { ...prev }; delete n[symbol]; return n; });
-    if (activePair === symbol) setActivePair(pairs.find((p) => p.symbol !== symbol)?.symbol || null);
+    setPairs(prev => prev.filter(p => p.symbol !== symbol));
+    if (active === symbol) setActive(pairs.find(p => p.symbol !== symbol)?.symbol);
     log("INFO", `Removed ${symbol}`);
   };
 
-  // Live refresh loop
-  const refresh = useCallback(async () => {
-    setPairs((prev) => {
-      Promise.all(prev.map(async (p) => {
-        const ticker = await fetchTicker(p.symbol);
-        const klines = await fetchKlines(p.symbol, "5m", 100);
-        if (!ticker) return p;
-        const closes = klines.map((k) => k.close);
-        const highs = klines.map((k) => k.high);
-        const lows = klines.map((k) => k.low);
-        const analysis = TE.analyze(closes, highs, lows);
-        setAnalyses((a) => ({ ...a, [p.symbol]: analysis }));
-        const minConf = mode === "AGGRESSIVE" ? 58 : 70;
-        if (analysis.confidence >= minConf && analysis.signal !== "HOLD" && analysis.signal !== "WAIT") {
-          log(analysis.signal, `${p.label} @ $${ticker.price.toFixed(2)} | Conf: ${analysis.confidence.toFixed(0)}% | SL: $${(analysis.sl||0).toFixed(2)} | TP: $${(analysis.tp||0).toFixed(2)}`);
-        }
-        return { ...p, price: ticker.price, changePercent: ticker.changePercent, high: ticker.high, low: ticker.low, closes, highs, lows };
-      })).then((updated) => setPairs(updated));
-      return prev;
-    });
-    setTick((t) => t + 1);
-  }, [mode, log]);
+  const refresh = async () => {
+    const updated = await Promise.all(pairs.map(async p => {
+      const ticker = await getTicker(p.symbol);
+      const closes = await getKlines(p.symbol);
+      if (!ticker) return p;
+      const a = analyze(closes);
+      setAnalyses(prev => ({ ...prev, [p.symbol]: a }));
+      const minConf = mode === "SAFE" ? 70 : 58;
+      if (a.conf >= minConf && a.signal !== "HOLD" && a.signal !== "WAIT") {
+        log(a.signal, `${p.label} @ $${ticker.price.toFixed(2)} | ${a.conf.toFixed(0)}% | SL:$${(a.sl||0).toFixed(2)} TP:$${(a.tp||0).toFixed(2)}`);
+      }
+      return { ...p, price: ticker.price, pct: ticker.pct, closes };
+    }));
+    setPairs(updated);
+    setTick(t => t + 1);
+  };
 
   useEffect(() => {
-    if (isRunning) {
-      log("SYS", `Bot STARTED — ${mode} mode — refreshing every 30s`);
+    if (running) {
+      log("SYS", `Bot STARTED — ${mode} mode`);
       refresh();
-      intervalRef.current = setInterval(refresh, 30000);
+      timer.current = setInterval(refresh, 30000);
     } else {
-      clearInterval(intervalRef.current);
-      if (tick > 0) log("SYS", "Bot PAUSED.");
+      clearInterval(timer.current);
+      if (tick > 0) log("SYS", "Bot PAUSED");
     }
-    return () => clearInterval(intervalRef.current);
-  }, [isRunning, mode]);
+    return () => clearInterval(timer.current);
+  }, [running, mode]);
 
-  const active = pairs.find((p) => p.symbol === activePair);
-  const activeAnalysis = activePair ? analyses[activePair] : null;
+  const activePair = pairs.find(p => p.symbol === active);
+  const activeA = active ? analyses[active] : null;
+  const fmt = (n) => n < 1 ? n?.toFixed(5) : n < 100 ? n?.toFixed(3) : n?.toFixed(2);
+  const sigColor = { BUY: "#00e87a", SELL: "#ff3d5a", HOLD: "#f5c518", WAIT: "#888" };
 
   return (
-    <div style={{ minHeight: "100vh", background: "#07090e", color: "#e0e4ec", fontFamily: "'DM Mono', 'Courier New', monospace" }}>
+    <div style={{ minHeight: "100vh", background: "#070a0f", color: "#dde", fontFamily: "monospace", padding: 0 }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Outfit:wght@400;600;700;800&display=swap');
-        *{box-sizing:border-box;margin:0;padding:0;}
-        ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1e2330;border-radius:2px}
-        @keyframes fadeIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-        @keyframes spin{to{transform:rotate(360deg)}}
-        .hov{transition:all 0.18s}.hov:hover{background:rgba(255,255,255,0.07)!important}
-        input{outline:none}
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1e2330}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+        @keyframes fadein{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+        .btn{cursor:pointer;transition:all .15s}.btn:hover{filter:brightness(1.2)}
+        input{outline:none;font-family:monospace}
       `}</style>
 
-      {/* TOPBAR */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px", borderBottom: "1px solid rgba(255,255,255,0.06)", background: "rgba(7,9,14,0.95)", backdropFilter: "blur(16px)", position: "sticky", top: 0, zIndex: 100 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 30, height: 30, borderRadius: 8, background: "linear-gradient(135deg,#00e87a,#00aaff)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 800, fontFamily: "'Outfit',sans-serif", color: "#000" }}>N</div>
-          <div>
-            <div style={{ fontFamily: "'Outfit',sans-serif", fontWeight: 800, fontSize: 14, letterSpacing: -0.3 }}>NEXUS TRADER</div>
-            <div style={{ fontSize: 9, color: "#444", letterSpacing: 1.5 }}>BINANCE SIGNAL BOT · LIVE DATA</div>
-          </div>
+      {/* HEADER */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 16px", borderBottom: "1px solid #1a1f2e", background: "#07090e", position: "sticky", top: 0, zIndex: 99 }}>
+        <div>
+          <div style={{ fontWeight: 800, fontSize: 15, letterSpacing: 1, color: "#00e87a" }}>⚡ NEXUS TRADER</div>
+          <div style={{ fontSize: 9, color: "#444", letterSpacing: 2 }}>BINANCE LIVE SIGNALS</div>
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <div style={{ display: "flex", background: "rgba(255,255,255,0.04)", borderRadius: 6, padding: 2, gap: 2 }}>
-            {["CONSERVATIVE", "AGGRESSIVE"].map((m) => (
-              <button key={m} onClick={() => setMode(m)} className="hov" style={{ padding: "4px 10px", borderRadius: 4, border: "none", cursor: "pointer", fontSize: 9, fontWeight: 700, letterSpacing: 1, fontFamily: "'DM Mono',monospace", background: mode === m ? (m === "CONSERVATIVE" ? "rgba(0,232,122,0.18)" : "rgba(255,61,90,0.18)") : "transparent", color: mode === m ? (m === "CONSERVATIVE" ? "#00e87a" : "#ff3d5a") : "#444" }}>
-                {m === "CONSERVATIVE" ? "🛡 SAFE" : "⚡ AGGR"}
-              </button>
-            ))}
-          </div>
-          <button onClick={() => setIsRunning((r) => !r)} className="hov" style={{ display:"flex", alignItems:"center", gap:5, padding:"6px 14px", borderRadius:6, border:`1px solid ${isRunning?"rgba(255,61,90,0.4)":"rgba(0,232,122,0.4)"}`, background: isRunning?"rgba(255,61,90,0.1)":"rgba(0,232,122,0.1)", color: isRunning?"#ff3d5a":"#00e87a", cursor:"pointer", fontSize:11, fontWeight:700, letterSpacing:1 }}>
-            <span style={{ animation: isRunning ? "pulse 1s infinite" : "none" }}>{isRunning ? "■" : "▶"}</span>
-            {isRunning ? "STOP" : "START"}
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="btn" onClick={() => setMode(m => m === "SAFE" ? "AGGR" : "SAFE")} style={{ padding: "5px 10px", borderRadius: 5, border: `1px solid ${mode === "SAFE" ? "#00e87a55" : "#ff3d5a55"}`, background: mode === "SAFE" ? "#00e87a15" : "#ff3d5a15", color: mode === "SAFE" ? "#00e87a" : "#ff3d5a", fontSize: 10, fontWeight: 700 }}>
+            {mode === "SAFE" ? "🛡 SAFE" : "⚡ AGGR"}
+          </button>
+          <button className="btn" onClick={() => setRunning(r => !r)} style={{ padding: "5px 12px", borderRadius: 5, border: `1px solid ${running ? "#ff3d5a55" : "#00e87a55"}`, background: running ? "#ff3d5a15" : "#00e87a15", color: running ? "#ff3d5a" : "#00e87a", fontSize: 11, fontWeight: 700 }}>
+            <span style={{ animation: running ? "pulse 1s infinite" : "none", display: "inline-block" }}>{running ? "■" : "▶"}</span> {running ? "STOP" : "START"}
           </button>
         </div>
       </div>
 
-      <div style={{ padding: "16px 20px", display: "grid", gap: 14, maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ padding: 14, display: "grid", gap: 12 }}>
 
-        {/* PAIR GRID + ADD BUTTON */}
+        {/* PAIRS */}
         <div>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <div style={{ fontSize: 10, color: "#444", letterSpacing: 1.5 }}>TRADING PAIRS ({pairs.length}/4) · <span style={{ color: "#f5c518" }}>AUTO</span> = top movers · <span style={{ color: "#888" }}>MANUAL</span> = your picks</div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, fontSize: 10, color: "#444" }}>
+            <span>PAIRS ({pairs.length}/4) · <span style={{ color: "#f5c518" }}>AUTO</span> = top movers</span>
             {pairs.length < 4 && (
-              <button onClick={() => setShowSearch((s) => !s)} className="hov" style={{ padding: "5px 12px", borderRadius: 6, border: "1px solid rgba(0,170,255,0.3)", background: "rgba(0,170,255,0.08)", color: "#00aaff", cursor: "pointer", fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>
-                {showSearch ? "✕ CANCEL" : "+ ADD PAIR"}
+              <button className="btn" onClick={() => setShowSearch(s => !s)} style={{ background: "none", border: "1px solid #00aaff55", color: "#00aaff", padding: "2px 8px", borderRadius: 4, fontSize: 10, cursor: "pointer" }}>
+                {showSearch ? "✕ CANCEL" : "+ ADD"}
               </button>
             )}
           </div>
 
-          {/* SEARCH BOX */}
           {showSearch && (
-            <div style={{ marginBottom: 12, animation: "fadeIn 0.2s ease" }}>
-              <div style={{ position: "relative" }}>
-                <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search pair e.g. BTC, SOL, DOGE..." style={{ width: "100%", padding: "10px 14px", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(0,170,255,0.3)", borderRadius: 8, color: "#ddd", fontSize: 12, fontFamily: "'DM Mono',monospace" }} autoFocus />
-                {searching && <span style={{ position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", fontSize: 14, animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span>}
+            <div style={{ marginBottom: 10, animation: "fadein .2s" }}>
+              <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search e.g. SOL, DOGE, ADA..." style={{ width: "100%", padding: "9px 12px", background: "#0d1018", border: "1px solid #00aaff44", borderRadius: 7, color: "#ddd", fontSize: 12 }} autoFocus />
+              {results.map(r => (
+                <div key={r.symbol} onClick={() => addPair(r)} className="btn" style={{ padding: "8px 12px", background: "#0d1018", borderBottom: "1px solid #1a1f2e", display: "flex", justifyContent: "space-between", fontSize: 12, cursor: "pointer" }}>
+                  <span style={{ fontWeight: 700, color: "#ccc" }}>{r.label}</span>
+                  <span style={{ color: r.pct >= 0 ? "#00e87a" : "#ff3d5a" }}>{r.pct >= 0 ? "▲" : "▼"}{Math.abs(r.pct).toFixed(2)}%</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {loading ? (
+            <div style={{ textAlign: "center", padding: 24, color: "#444" }}>Loading Binance data...</div>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {pairs.map(p => {
+                const a = analyses[p.symbol];
+                const sc = sigColor[a?.signal] || "#888";
+                const isAct = active === p.symbol;
+                return (
+                  <div key={p.symbol} onClick={() => setActive(p.symbol)} className="btn" style={{ padding: 12, borderRadius: 9, border: `1px solid ${isAct ? "#00e87a44" : "#1a1f2e"}`, background: isAct ? "#00e87a08" : "#0d1018", position: "relative", cursor: "pointer" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: isAct ? "#00e87a" : "#aaa" }}>{p.label}</span>
+                      {p.auto && <span style={{ fontSize: 8, background: "#f5c51820", color: "#f5c518", padding: "1px 4px", borderRadius: 3 }}>AUTO</span>}
+                    </div>
+                    <div style={{ fontSize: 17, fontWeight: 800, color: "#fff" }}>${fmt(p.price)}</div>
+                    <div style={{ fontSize: 10, color: p.pct >= 0 ? "#00e87a" : "#ff3d5a", marginTop: 2 }}>{p.pct >= 0 ? "▲" : "▼"}{Math.abs(p.pct).toFixed(2)}%</div>
+                    {a && <div style={{ marginTop: 6, fontSize: 10, fontWeight: 700, color: sc }}>● {a.signal} {a.conf > 0 ? `${a.conf.toFixed(0)}%` : ""}</div>}
+                    {!p.auto && (
+                      <button onClick={e => { e.stopPropagation(); removePair(p.symbol); }} style={{ position: "absolute", top: 6, right: 6, background: "#ff3d5a22", border: "1px solid #ff3d5a44", color: "#ff3d5a", borderRadius: 3, width: 16, height: 16, fontSize: 9, cursor: "pointer" }}>✕</button>
+                    )}
+                  </div>
+                );
+              })}
+              {pairs.length < 4 && !showSearch && (
+                <div onClick={() => setShowSearch(true)} className="btn" style={{ padding: 12, borderRadius: 9, border: "1px dashed #1a1f2e", background: "#0a0c10", display: "flex", alignItems: "center", justifyContent: "center", color: "#2a3040", fontSize: 12, cursor: "pointer", minHeight: 80 }}>+ Add pair</div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* ACTIVE PAIR DETAIL */}
+        {activePair && activeA && (
+          <>
+            {/* Signal Box */}
+            <div style={{ padding: 14, background: "#0d1018", borderRadius: 10, border: `1px solid ${sigColor[activeA.signal]}33` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontSize: 11, color: "#555", marginBottom: 2 }}>{activePair.label} · 5m chart</div>
+                  <div style={{ fontSize: 26, fontWeight: 800, color: "#fff" }}>${fmt(activePair.price)}</div>
+                  <div style={{ fontSize: 11, color: activePair.pct >= 0 ? "#00e87a" : "#ff3d5a", marginTop: 2 }}>{activePair.pct >= 0 ? "▲" : "▼"}{Math.abs(activePair.pct).toFixed(2)}% 24h</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: sigColor[activeA.signal] }}>{activeA.signal}</div>
+                  <div style={{ fontSize: 11, color: "#666" }}>{activeA.conf.toFixed(0)}% confidence</div>
+                </div>
               </div>
-              {searchResults.length > 0 && (
-                <div style={{ marginTop: 6, background: "#0d1018", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, overflow: "hidden" }}>
-                  {searchResults.map((r) => (
-            
+
+              {/* Confidence Bar */}
+              <div style={{ marginTop: 12, height: 5, background: "#1a1f2e", borderRadius: 3, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${activeA.conf}%`, background: sigColor[activeA.signal], borderRadius: 3, transition: "width .8s" }} />
+              </div>
+
+              {/* Trade Levels */}
+              {activeA.signal !== "HOLD" && activeA.signal !== "WAIT" && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 12 }}>
+                  {[["📍 Entry", activePair.price, "#f5c518"], ["🛑 Stop Loss", activeA.sl, "#ff3d5a"], ["🎯 Take Profit", activeA.tp, "#00e87a"]].map(([label, val, color]) => (
+                    <div key={label} style={{ padding: "8px 10px", background: "#070a0f", borderRadius: 7, border: `1px solid ${color}22` }}>
+                      <div style={{ fontSize: 9, color: "#555", marginBottom: 3 }}>{label}</div>
+                      <div style={{ fontSize: 12, fontWeight: 700, color }}>${fmt(val)}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Advice */}
+              <div style={{ marginTop: 10, padding: "8px 10px", background: "#070a0f", borderRadius: 7, fontSize: 10, color: "#888", lineHeight: 1.6 }}>
+                {activeA.signal === "BUY" && `✅ Buy signal! Enter around $${fmt(activePair.price)}. Set stop loss at $${fmt(activeA.sl)} on Binance. Target $${fmt(activeA.tp)}.`}
+                {activeA.signal === "SELL" && `🔴 Sell/avoid signal. Price may drop. If holding, consider exit.`}
+                {(activeA.signal === "HOLD" || activeA.signal === "WAIT") && `⏳ No clear signal yet. Wait for stronger confirmation.`}
+              </div>
+            </div>
+
+            {/* Indicators */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+              {/* RSI */}
+              <div style={{ padding: 10, background: "#0d1018", borderRadius: 9, border: "1px solid #1a1f2e" }}>
+                <div style={{ fontSize: 9, color: "#555", marginBottom: 5 }}>RSI (14)</div>
+                <div style={{ height: 3, background: "#1a1f2e", borderRadius: 2, overflow: "hidden", marginBottom: 5 }}>
+                  <div style={{ height: "100%", width: `${activeA.rsi}%`, background: activeA.rsi > 70 ? "#ff3d5a" : activeA.rsi < 30 ? "#00e87a" : "#00aaff", transition: "width .5s" }} />
+                </div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: activeA.rsi > 70 ? "#ff3d5a" : activeA.rsi < 30 ? "#00e87a" : "#fff" }}>{activeA.rsi.toFixed(0)}</div>
+                <div style={{ fontSize: 9, color: "#555", marginTop: 2 }}>{activeA.rsi > 70 ? "OVERBOUGHT" : activeA.rsi < 30 ? "OVERSOLD" : "NEUTRAL"}</div>
+              </div>
+              {/* EMA */}
+              <div style={{ padding: 10, background: "#0d1018", borderRadius: 9, border: "1px solid #1a1f2e" }}>
+                <div style={{ fontSize: 9, color: "#555", marginBottom: 5 }}>EMA TREND</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: activePair.price > (activeA.ema20 || 0) ? "#00e87a" : "#ff3d5a" }}>{activePair.price > (activeA.ema20 || 0) ? "BULLISH ▲" : "BEARISH ▼"}</div>
+                <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>EMA20: ${fmt(activeA.ema20)}</div>
+              </div>
+              {/* BB */}
+              <div style={{ padding: 10, background: "#0d1018", borderRadius: 9, border: "1px solid #1a1f2e" }}>
+                <div style={{ fontSize: 9, color: "#555", marginBottom: 5 }}>BOLLINGER</div>
+                {activeA.bb ? (
+                  <>
+                    <div style={{ height: 3, background: "#1a1f2e", borderRadius: 2, overflow: "hidden", marginBottom: 5 }}>
+                      <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, ((activePair.price - activeA.bb.lower) / (activeA.bb.upper - activeA.bb.lower)) * 100))}%`, background: activePair.price > activeA.bb.upper ? "#ff3d5a" : activePair.price < activeA.bb.lower ? "#00e87a" : "#f5c518", transition: "width .5s" }} />
+                    </div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: activePair.price > activeA.bb.upper ? "#ff3d5a" : activePair.price < activeA.bb.lower ? "#00e87a" : "#f5c518" }}>{activePair.price > activeA.bb.upper ? "OVERBOUGHT" : activePair.price < activeA.bb.lower ? "OVERSOLD" : "IN RANGE"}</div>
+                  </>
+                ) : <div style={{ color: "#333", fontSize: 10 }}>Loading...</div>}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* BOT STATUS + LOG */}
+        <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 8 }}>
+          <div style={{ padding: 12, background: "#0d1018", borderRadius: 9, border: `1px solid ${running ? "#00e87a33" : "#1a1f2e"}`, minWidth: 100 }}>
+            <div style={{ fontSize: 9, color: "#444", marginBottom: 6 }}>STATUS</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ width: 7, height: 7, borderRadius: "50%", background: running ? "#00e87a" : "#333", animation: running ? "pulse 1.2s infinite" : "none", boxShadow: running ? "0 0 8px #00e87a" : "none" }} />
+              <span style={{ fontSize: 11, fontWeight: 700, color: running ? "#00e87a" : "#444" }}>{running ? "LIVE" : "OFF"}</span>
+            </div>
+            <div style={{ fontSize: 9, color: "#444", marginTop: 6, lineHeight: 1.7 }}>
+              <div>{mode} mode</div>
+              <div>Tick #{tick}</div>
+              <div>30s refresh</div>
+            </div>
+          </div>
+          <div style={{ padding: 12, background: "#0d1018", borderRadius: 9, border: "1px solid #1a1f2e", overflow: "hidden" }}>
+            <div style={{ fontSize: 9, color: "#444", marginBottom: 6 }}>ACTIVITY LOG</div>
+            <div style={{ height: 100, overflowY: "auto" }}>
+              {logs.length === 0 ? <div style={{ color: "#222", fontSize: 10 }}>Press START...</div> : logs.map(l => {
+                const c = { SYS: "#555", INFO: "#4488ff", BUY: "#00e87a", SELL: "#ff3d5a", WARN: "#f5c518" }[l.type] || "#888";
+                return (
+                  <div key={l.id} style={{ display: "flex", gap: 5, padding: "3px 0", borderBottom: "1px solid #0f1218", fontSize: 9, animation: "fadein .2s" }}>
+                    <span style={{ color: "#333", flexShrink: 0 }}>{l.time}</span>
+                    <span style={{ color: c, fontWeight: 700, flexShrink: 0, width: 32 }}>{l.type}</span>
+                    <span style={{ color: "#999", lineHeight: 1.4 }}>{l.msg}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
